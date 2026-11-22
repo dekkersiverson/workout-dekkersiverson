@@ -1,0 +1,20 @@
+node_modules
+dist
+.DS_Store
+
+# Cached sheet data for the test scripts
+scripts/.fixture.json
+
+# Secrets — never commit
+*.local
+.env
+.env.*
+!.env.example
+api_key.txt
+access_token.txt
+git_push.txt
+
+# Documentos personales (p. ej. el código de acceso): nunca al repositorio
+*.docx
+*.pdf
+*.txt

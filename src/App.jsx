@@ -1,0 +1,218 @@
+import { useState, useEffect, useMemo, useCallback, useRef } from 'react';
+import { nextDayAfter, SYNC_CONFIG } from './config.js';
+import { mesocycleState } from './mesocycles.js';
+import { fetchFromSheet } from './sheets.js';
+import { useStore, pruneSynced, deletedIds } from './store.js';
+import { syncNow, countPending } from './sync.js';
+import { toSessions, byExercise, weeklyLoad, today as todayIso } from './analysis.js';
+import Today from './views/Today.jsx';
+import PlanView from './views/PlanView.jsx';
+import LogView from './views/LogView.jsx';
+import ProgressView from './views/ProgressView.jsx';
+import BodyView from './views/BodyView.jsx';
+
+const VIEWS = [
+  { id: 'today',    glyph: '◉', label: 'Hoy' },
+  { id: 'plan',     glyph: '◎', label: 'Plan' },
+  { id: 'log',      glyph: '≡', label: 'Registro' },
+  { id: 'progress', glyph: '↗', label: 'Progreso' },
+  { id: 'body',     glyph: '◇', label: 'Cuerpo' },
+];
+
+export default function App() {
+  const [view, setView] = useState('today');
+  const [remote, setRemote] = useState({ sets: [], bodyweight: [], partner: [], notes: [] });
+  const [sync, setSync] = useState({ source: null, error: null, at: null });
+  const [pushing, setPushing] = useState(false);
+  const [pushError, setPushError] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [selectedExercise, setSelectedExercise] = useState(null);
+  const [toast, setToast] = useState(null);
+  const toastTimer = useRef(null);
+
+  const local = useStore();
+
+  const showToast = useCallback((message) => {
+    setToast(message);
+    clearTimeout(toastTimer.current);
+    toastTimer.current = setTimeout(() => setToast(null), 2200);
+  }, []);
+
+  useEffect(() => () => clearTimeout(toastTimer.current), []);
+
+  const pull = useCallback(async () => {
+    setLoading(true);
+    try {
+      const result = await fetchFromSheet();
+      setRemote(result);
+      setSync({ source: 'sheets', error: null, at: new Date().toISOString() });
+    } catch (err) {
+      console.warn('[sheets]', err.message);
+      setSync((s) => ({ ...s, source: s.source || 'local', error: err.message }));
+    }
+    setLoading(false);
+  }, []);
+
+  useEffect(() => { pull(); }, [pull]);
+
+  // ── Push local records to the Sheet ───────────────────────────────────
+  const pending = countPending(local);
+
+  const push = useCallback(async (announce = true) => {
+    if (!SYNC_CONFIG.enabled || pushing) return;
+    setPushing(true);
+    const result = await syncNow();
+    setPushing(false);
+    setPushError(result.ok ? null : result.reason);
+    if (result.ok && result.written > 0) {
+      if (announce) showToast(`${result.written} guardado${result.written === 1 ? '' : 's'} en la hoja`);
+      pull();  // read them back so local copies can be pruned
+    }
+  }, [pushing, showToast, pull]);
+
+  // Drain the queue whenever there is something to send, and again as soon as
+  // the connection comes back after a session logged offline.
+  useEffect(() => {
+    if (pending > 0) push(false);
+  }, [pending]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    const onOnline = () => push(false);
+    window.addEventListener('online', onOnline);
+    return () => window.removeEventListener('online', onOnline);
+  }, [push]);
+
+  // ── Merge remote and local ────────────────────────────────────────────
+  // A record the Sheet has echoed back is dropped from the local copy, so a
+  // synced set is never counted twice.
+  const remoteIds = useMemo(() => ({
+    sets: new Set(remote.sets.map((s) => s.id).filter(Boolean)),
+    partner: new Set(remote.partner.map((g) => g.id).filter(Boolean)),
+    bodyweight: new Set(remote.bodyweight.map((b) => b.id).filter(Boolean)),
+  }), [remote]);
+
+  useEffect(() => { pruneSynced(remoteIds); }, [remoteIds]);
+
+  // An undone set may still be sitting in the Sheet until the deletion syncs.
+  const removed = useMemo(() => deletedIds(local), [local]);
+
+  const data = useMemo(
+    () => [
+      ...remote.sets.filter((s) => !removed.has(s.id)),
+      ...local.sets.filter((s) => !remoteIds.sets.has(s.id) && !removed.has(s.id)),
+    ],
+    [remote.sets, local.sets, remoteIds, removed],
+  );
+
+  const partner = useMemo(() => {
+    const merged = new Map();
+    for (const g of remote.partner) merged.set(g.date, g);
+    for (const g of local.partner) if (!remoteIds.partner.has(g.id)) merged.set(g.date, g);
+    return [...merged.values()].sort((a, b) => a.date.localeCompare(b.date));
+  }, [remote.partner, local.partner, remoteIds]);
+
+  const bodyweight = useMemo(() => {
+    const merged = new Map();
+    for (const b of remote.bodyweight) merged.set(b.date, b);
+    for (const b of local.bodyweight) if (!remoteIds.bodyweight.has(b.id)) merged.set(b.date, b);
+    return [...merged.values()].sort((a, b) => a.date.localeCompare(b.date));
+  }, [remote.bodyweight, local.bodyweight, remoteIds]);
+
+  const sessions = useMemo(() => toSessions(data), [data]);
+  const history = useMemo(() => byExercise(data), [data]);
+  const loadWeeks = useMemo(() => weeklyLoad(sessions, partner, 12), [sessions, partner]);
+
+  // ── Where we are in the plan ──────────────────────────────────────────
+  const iso = todayIso();
+
+  // Today's session is in progress, so it must not advance the block counter.
+  const completed = useMemo(
+    () => sessions.map((s) => s.date).filter((d) => d < iso),
+    [sessions, iso],
+  );
+
+  const meso = useMemo(() => mesocycleState(completed), [completed]);
+
+  const { day, lastSessionDate } = useMemo(() => {
+    const todaySession = sessions.find((s) => s.date === iso);
+    if (todaySession) {
+      const previous = sessions.find((s) => s.date < iso);
+      return { day: todaySession.day, lastSessionDate: previous?.date || null };
+    }
+    const previous = sessions.find((s) => s.date < iso);
+    return { day: previous ? nextDayAfter(previous.day) : 'A', lastSessionDate: previous?.date || null };
+  }, [sessions, iso]);
+
+  if (loading && !data.length && !sync.error) {
+    return (
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: '100vh' }}>
+        <div style={{ textAlign: 'center', color: 'var(--ink-3)' }}>
+          <div style={{ fontSize: 30, marginBottom: 10 }}>◎</div>
+          <div className="mono" style={{ fontSize: 13 }}>Cargando entrenamientos…</div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <>
+      <div className={`banner ${pending > 0 || sync.error || pushError ? 'warn' : 'ok'}`}>
+        <span>
+          {pending > 0
+            ? `● ${pending} ${pending === 1 ? 'registro pendiente' : 'registros pendientes'} de guardar`
+            : sync.source === 'sheets' && !sync.error
+              ? `● Guardado en la hoja · ${data.length} series`
+              : `● Sin conexión · ${data.length} series en este dispositivo`}
+          {(sync.error || pushError) && (
+            <span style={{ display: 'block', fontSize: 11.5, opacity: .85 }}>
+              {pushError || sync.error}
+            </span>
+          )}
+          {!pending && sync.at && (
+            <span style={{ color: 'var(--ink-3)', marginLeft: 10 }}>
+              {new Date(sync.at).toLocaleTimeString('es-ES', { hour: '2-digit', minute: '2-digit' })}
+            </span>
+          )}
+        </span>
+        <span className="row" style={{ gap: 6 }}>
+          {pending > 0 && SYNC_CONFIG.enabled && (
+            <button className="btn small primary" onClick={() => push(true)} disabled={pushing}>
+              {pushing ? 'Guardando…' : '↑ Guardar ya'}
+            </button>
+          )}
+          <button className="btn small ghost" onClick={pull} disabled={loading}>
+            {loading ? 'Actualizando…' : '⟳ Actualizar'}
+          </button>
+        </span>
+      </div>
+
+      <nav className="nav">
+        {VIEWS.map((v) => (
+          <button key={v.id} className="nav-item" aria-current={view === v.id ? 'page' : undefined}
+            onClick={() => setView(v.id)}>
+            <span className="glyph" aria-hidden="true">{v.glyph}</span>
+            <span>{v.label}</span>
+          </button>
+        ))}
+      </nav>
+
+      {view === 'today' && (
+        <Today meso={meso} day={day} history={history} data={data}
+          partner={partner} lastSessionDate={lastSessionDate} onToast={showToast} />
+      )}
+      {view === 'plan' && <PlanView meso={{ ...meso, currentDay: day }} history={history} />}
+      {view === 'log' && (
+        <LogView sessions={sessions} data={data} weeklyLoadData={loadWeeks} onToast={showToast} />
+      )}
+      {view === 'progress' && (
+        <ProgressView history={history} sessions={sessions}
+          selected={selectedExercise} onSelect={setSelectedExercise} />
+      )}
+      {view === 'body' && (
+        <BodyView bodyweight={bodyweight} partner={partner} onToast={showToast} onCodeChanged={pull} />
+      )}
+
+      {toast && <div className="toast" role="status">{toast}</div>}
+    </>
+  );
+}
